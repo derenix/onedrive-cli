@@ -1,20 +1,22 @@
 #!/usr/bin/env node
 
-const RP     = require('request-promise-native')
+const RP = require('request-promise-native')
 const Colors = require('colors')
 const Moment = require('moment')
-const FS     = require('fs')
-const Mime   = require('mime')
-const Path   = require('path')
-const Url    = require('url')
+const FS = require('fs')
+const Mime = require('mime')
+const Path = require('path')
+const Url = require('url')
 const Crypto = require('crypto')
-const Zlib   = require('zlib')
+const Zlib = require('zlib')
+const request = require('request')
+const mkdirp = require('mkdirp');
 
-const TOKEN_PATH = Path.join(require('os').homedir(),'.onedrive-cli-token')
+const TOKEN_PATH = Path.join(require('os').homedir(), '.onedrive-cli-token')
 
 
 function padLeft(str, len) {
-    return String('                '+str).slice(-len)
+    return String('                ' + str).slice(-len)
 }
 
 
@@ -24,37 +26,38 @@ function padRight(str, len) {
 
 
 function readFile(filename) {
-    return new Promise( (resolve,reject) => {
-        FS.readFile(filename, (err,data) => err?reject(err):resolve(data) )
+    return new Promise((resolve, reject) => {
+        FS.readFile(filename, (err, data) => err ? reject(err) : resolve(data))
     })
 }
 
 
 function writeFile(filename, data) {
-    return new Promise( (resolve,reject) => {
-        FS.writeFile(filename, data, err => err?reject(err):resolve() )
+    return new Promise((resolve, reject) => {
+        FS.writeFile(filename, data, err => err ? reject(err) : resolve())
     })
 }
 
 
 function print(data) {
-    return new Promise( (resolve,reject) => {
-        process.stdout.write(data, err => err?reject(err):resolve() )
+    return new Promise((resolve, reject) => {
+        process.stdout.write(data, err => err ? reject(err) : resolve())
     })
 }
 
 
 function unlink(path) {
-    return new Promise( (resolve,reject) => {
-        FS.unlink(path, err => err?reject(err):resolve() )
+    return new Promise((resolve, reject) => {
+        FS.unlink(path, err => err ? reject(err) : resolve())
     })
 }
 
 
 function humanize(num) {
     const units = ["", "Ki", "Mi", "Gi", "Ti", "Pi"]
-    var str, unit = "", div = 0
-    for(;;) {
+    var str, unit = "",
+        div = 0
+    for (;;) {
         var str = Math.round(num / Math.pow(1024, div))
         if (str <= 9999) {
             return str + units[div]
@@ -64,18 +67,22 @@ function humanize(num) {
 }
 
 
-function pp(num) { return padLeft(humanize(num), 6) }
+function pp(num) {
+    return padLeft(humanize(num), 6)
+}
 
 
-var lazyToken = function() {
+var lazyToken = function () {
     return readFile(TOKEN_PATH)
         .then(buffer => {
             const token = Promise.resolve(buffer.toString())
             // Next time we're invoked, simply return the resolved promise
-            lazyToken = function() { return token; }
+            lazyToken = function () {
+                return token;
+            }
             return token
         })
-    }
+}
 
 
 function call(url, method, body, mime) {
@@ -86,8 +93,7 @@ function call(url, method, body, mime) {
     if (body instanceof Buffer) {
         body = Zlib.gzipSync(body)
         contentEncoding = 'gzip'
-    }
-    else if (typeof body === 'object') {
+    } else if (typeof body === 'object') {
         if ("@content.sourceUrl" in body) {
             prefer = 'respond-async'
         }
@@ -96,25 +102,25 @@ function call(url, method, body, mime) {
     }
 
     var options = {
-            uri: url,
-            body: body,
-            method: method,
-            headers: {
-                'Content-Type': mime || 'application/octet-stream',
-                'Content-Encoding': contentEncoding,
-                Prefer: prefer
-            }
+        uri: url,
+        body: body,
+        method: method,
+        headers: {
+            'Content-Type': mime || 'application/octet-stream',
+            'Content-Encoding': contentEncoding,
+            Prefer: prefer
+        }
     };
 
     if (!url.startsWith('https://api.onedrive.com')) {
-      options.baseUrl = 'https://api.onedrive.com/v1.0/'
+        options.baseUrl = 'https://api.onedrive.com/v1.0/'
     }
 
     return lazyToken()
         .then(token => {
             options.headers.Authorization = 'bearer ' + token;
             return RP(options)
-         })
+        })
         .then(data => {
             return data === '' ? null : JSON.parse(data)
         })
@@ -128,9 +134,9 @@ function getContent(url) {
             baseUrl: 'https://api.onedrive.com/v1.0/',
             uri: url,
             headers: {
-                Authorization: 'bearer '+token
+                Authorization: 'bearer ' + token
             }
-        }) )
+        }))
 }
 
 
@@ -148,21 +154,128 @@ function df() {
     return call('/drives')
         .then(result => {
             console.log(Colors.bold('Drive              Size   Used  Avail Capacity Deleted Status'))
-            for(var i in result.value) {
+            for (var i in result.value) {
                 const drive = result.value[i]
-                const capacity = Math.round(drive.quota.used*100 / drive.quota.total)+'% '
+                const capacity = Math.round(drive.quota.used * 100 / drive.quota.total) + '% '
                 console.log(
-                    padRight(drive.id,16),
+                    padRight(drive.id, 16),
                     pp(drive.quota.total),
                     pp(drive.quota.used),
                     pp(drive.quota.remaining),
-                    padLeft(capacity,9),
+                    padLeft(capacity, 9),
                     pp(drive.quota.deleted),
                     drive.status.state)
             }
         })
 }
 
+
+function downloadFolder(args) {
+    if (args.length !== 2) {
+        console.error("usage: download-folder remote-folder local-folder");
+        return;
+    }
+
+    const folder = args[0]
+    let base = args[1];
+
+    if (!base.endsWith("/")) {
+        base += "/";
+    }
+
+    function downloadPage(url) {
+
+        call(url).then(result => {
+            let toDownload = result.value.length;
+            let downloaded = 0;
+
+            result.value.forEach(f => {
+                const downloadUrl = f["@content.downloadUrl"];
+
+                if (typeof downloadUrl === "undefined") {
+                    console.log("Ignoring ", f.name);
+                    toDownload--;
+                    return;
+                }
+
+                const date = f.name.split("_")[0];
+                const year = date.substring(0, 4);
+                const month = date.substring(4, 6);
+                const day = date.substring(6, 8);
+
+                const datePath = [year, month, day, ""].join("/");
+
+                mkdirp.sync(base + datePath);
+
+                const toFilePath = base + datePath + f.name;
+
+                if (FS.existsSync(toFilePath)) {
+
+                    const fd = FS.openSync(toFilePath, 'r');
+                    const stats = FS.fstatSync(fd);
+
+                    if (stats.size === 0) {
+                        console.warn("WARNING: File at ", toFilePath, "has 0B size. Deleting & downloading again.");
+                        FS.unlinkSync(toFilePath);
+                    } else {
+                        //console.log("File already exists: " + toFilePath);
+                        toDownload--;
+
+                        return;
+                    }
+                }
+
+                const toFile = FS.createWriteStream(toFilePath);
+
+                const sendReq = request.get(downloadUrl);
+
+                // verify response code
+                sendReq.on('response', function (response) {
+                    if (response.statusCode !== 200) {
+                        throw new Error('Response status was ' + response.statusCode);
+                    }
+                });
+
+                // check for request errors
+                sendReq.on('error', function (err) {
+                    FS.unlink(toFilePath);
+                    console.log("Unable to download file:", err);
+                });
+
+                sendReq.pipe(toFile);
+
+                toFile.on('finish', function () {
+                    toFile.close();
+                    downloaded++;
+
+                    if (downloaded % 10 === 0) {
+                        const perc = downloaded * 100 / toDownload;
+                        console.log(Colors.green(perc.toFixed(0) + "% done") + " (" + downloaded + "/" + toDownload + ")");
+                    }
+                });
+
+                toFile.on('error', function (err) {
+                    FS.unlink(toFilePath);
+                    throw new Error("Unable to write file: ", err.message);
+                });
+            });
+
+            console.log("Started ", toDownload, "downloads.");
+
+            if (result['@odata.nextLink']) {
+                let inter = setInterval(() => {
+                    if (downloaded === toDownload) {
+                        console.log("Downloading next page...");
+                        downloadPage(result['@odata.nextLink']);
+                        clearInterval(inter);
+                    }
+                }, 100);
+            }
+        });
+    }
+
+    downloadPage('/drive/root' + sanitize(folder) + ':/children');
+}
 
 
 function listPage(total, cont) {
@@ -173,45 +286,41 @@ function listPage(total, cont) {
     return call(cont)
         .then(result => {
             const now = Moment()
-            const threshold = 1000*60*60*24*180//180days
-            for(var i in result.value) {
+            const threshold = 1000 * 60 * 60 * 24 * 180 //180days
+            for (var i in result.value) {
                 const f = result.value[i]
                 const m = Moment(f.lastModifiedDateTime)
                 const d = "folder" in f
                 var mod = d ? 'drwx' : '-rw-'
                 if ("shared" in f) {
-                    if ("effectiveRoles" in f.shared && f.shared.effectiveRoles.length === 1
-                        && f.shared.effectiveRoles[0] === 'read') {
+                    if ("effectiveRoles" in f.shared && f.shared.effectiveRoles.length === 1 &&
+                        f.shared.effectiveRoles[0] === 'read') {
                         mod += d ? 'r-x' : 'r--'
                         if (f.shared.scope === 'anonymous') {
                             mod += d ? 'r-x' : 'r--'
-                        }
-                        else {
+                        } else {
                             mod += '---'
                         }
-                    }
-                    else {
+                    } else {
                         mod += d ? 'rwx' : 'rw-'
                         if (f.shared.scope === 'anonymous') {
                             mod += d ? 'rwx' : 'rw-'
-                        }
-                        else {
+                        } else {
                             mod += '---'
                         }
                     }
-                }
-                else {
+                } else {
                     mod += '------'
                 }
                 const count = d ? f.folder.childCount : 1
                 total += count
                 console.log(
                     mod,
-                    padLeft(count,3),
+                    padLeft(count, 3),
                     f.createdBy.user.displayName,
-                    padLeft(f.size,10),
-                    m.format(Math.abs(now-m)<threshold ? 'MMM DD HH:mm' : 'MMM DD  YYYY'),
-                    d ? Colors.bold(Colors.blue(f.name))+'/' : f.name)
+                    padLeft(f.size, 10),
+                    m.format(Math.abs(now - m) < threshold ? 'MMM DD HH:mm' : 'MMM DD  YYYY'),
+                    d ? Colors.bold(Colors.blue(f.name)) + '/' : f.name)
             }
             return listPage(total, result['@odata.nextLink'])
         })
@@ -224,10 +333,10 @@ function ls(folders) {
     }
 
     //console.log(Colors.bold('Permission Cnt Owner            Size     Date         Name'))
-    return folders.reduce( (prevp,folder) =>
-            prevp.then(prev => listPage(prev, '/drive/root'+sanitize(folder)+':/children') ),
+    return folders.reduce((prevp, folder) =>
+            prevp.then(prev => listPage(prev, '/drive/root' + sanitize(folder) + ':/children')),
             Promise.resolve(0))
-        .then(result => "total "+result)
+        .then(result => "total " + result)
 }
 
 
@@ -247,11 +356,11 @@ function upload(copy, from, to) {
     const mime = Mime.lookup(from)
     return readFile(from)
         .then(data => {
-            return call('/drive/root'+to+':/content?@name.conflictBehavior=fail', 'PUT', data, mime)
+            return call('/drive/root' + to + ':/content?@name.conflictBehavior=fail', 'PUT', data, mime)
                 .then(result => {
                     const sha1 = Crypto.createHash("sha1").update(data).digest('hex')
                     if (sha1.toUpperCase() !== result.file.hashes.sha1Hash) {
-                        throw new Error("sha1Hash mismatch: "+to)
+                        throw new Error("sha1Hash mismatch: " + to)
                     }
                     return result
                 })
@@ -260,8 +369,7 @@ function upload(copy, from, to) {
             if (copy === 'move') {
                 console.log(from, '=>', to, result.id)
                 return unlink(from)
-            }
-            else {
+            } else {
                 console.log(from, '->', to, result.id)
             }
         })
@@ -288,22 +396,21 @@ Prefer: respond-async
 function wget(args) {
     if (args.length < 2) {
         console.error("usage: wget url target")
-    }
-    else {
+    } else {
         var to = args.pop()
         const from = args[0].startsWith('http') ? args[0] : "http://" + args[0]
         const data = {
             "@content.sourceUrl": from,
             name: Path.basename(to),
-            file: { }
+            file: {}
         }
         if (data.name === '' || to.endsWith('/')) {
             throw new Error("Invalid target name")
         }
-        var path = Path.dirname(to+"hack")
+        var path = Path.dirname(to + "hack")
         to = sanitize(to)
         path = sanitize(path)
-        return call('/drive/root'+path+':/children', 'POST', data)
+        return call('/drive/root' + path + ':/children', 'POST', data)
             .then(result => {
                 console.log(from, '-->', to)
             })
@@ -325,15 +432,14 @@ function download(copy, from, to) {
         to = to + Path.basename(from)
     }
     from = sanitize(from)
-    return getContent('/drive/root'+from+':/content')
+    return getContent('/drive/root' + from + ':/content')
         .then(data => writeFile(to, data))
         .then(result => {
             if (copy === 'move') {
                 console.log(from, '=>', to)
                 return rm(from)
-            }
-            else {
-                console.log(from, '->', to)
+            } else {
+                console.log(from, '->', to, result);
             }
         })
 }
@@ -345,20 +451,17 @@ function cp_mv(copy, args) {
 
     if (args[0].startsWith(':/') && to.startsWith(':/')) {
         throw new Error(`Remote ${copy} is not implemented.`)
-    }
-    else if (args[0].startsWith('./') && to.startsWith('./')) {
+    } else if (args[0].startsWith('./') && to.startsWith('./')) {
         throw new Error(`Local ${copy} is not implemented.`)
     }
 
     if (args[0].startsWith('./') || to.startsWith(':/')) {
         // from local to onedrive
-        return args.reduce( (prevp,cur) => prevp.then(_ => upload(copy, cur, to)), Promise.resolve(0))
-    }
-    else if (args[0].startsWith(':/') || to.startsWith('./') || to === '.') {
+        return args.reduce((prevp, cur) => prevp.then(_ => upload(copy, cur, to)), Promise.resolve(0))
+    } else if (args[0].startsWith(':/') || to.startsWith('./') || to === '.') {
         // from onedrive to local
-        return args.reduce( (prevp,cur) => prevp.then(_ => download(copy, cur, to)), Promise.resolve(0))
-    }
-    else {
+        return args.reduce((prevp, cur) => prevp.then(_ => download(copy, cur, to)), Promise.resolve(0))
+    } else {
         throw new Error('Use ./ or :/ path prefix for local or remote paths.')
     }
 }
@@ -368,8 +471,7 @@ function cp(args) {
     if (args.length < 2) {
         console.error("usage: cp source target")
         console.error("       cp source ... directory")
-    }
-    else {
+    } else {
         return cp_mv('copy', args)
     }
 }
@@ -378,8 +480,7 @@ function cp(args) {
 function rm(args) {
     if (args.length < 1) {
         console.error("usage: rm file ...")
-    }
-    else {
+    } else {
         const to = args.pop()
         throw new Error("Remove is not implemented")
     }
@@ -390,8 +491,7 @@ function mv(args) {
     if (args.length < 2) {
         console.error("usage: mv source target")
         console.error("       mv source ... directory")
-    }
-    else {
+    } else {
         return cp_mv('move', args)
     }
 }
@@ -399,24 +499,23 @@ function mv(args) {
 
 function cat1(remote) {
     remote = sanitize(remote)
-    return getContent('/drive/root'+remote+':/content')
-        .then(data => print(data) )
+    return getContent('/drive/root' + remote + ':/content')
+        .then(data => print(data))
 }
 
 
 function cat(args) {
     if (args.length < 1) {
         console.error("usage: cat file ...")
-    }
-    else {
-        return args.reduce( (prevp,cur) => prevp.then(_ => cat1(cur)), Promise.resolve())
+    } else {
+        return args.reduce((prevp, cur) => prevp.then(_ => cat1(cur)), Promise.resolve())
     }
 }
 
 
 function loginUrl() {
     console.log("\nBrowse to",
-        Colors.underline("https://login.live.com/oauth20_authorize.srf?client_id=0000000040197E82&scope=onedrive.readwrite&response_type=token&redirect_uri=http%3A%2F%2Fblog.enuma.io%2Fonedrive-cli%2Foauthcallbackhandler.html") )
+        Colors.underline("https://login.live.com/oauth20_authorize.srf?client_id=0000000040197E82&scope=onedrive.readwrite&response_type=token&redirect_uri=http%3A%2F%2Fblog.enuma.io%2Fonedrive-cli%2Foauthcallbackhandler.html"))
 }
 
 
@@ -424,9 +523,8 @@ function login(args) {
     const token = args.pop()
     if (typeof token === 'string') {
         return writeFile(TOKEN_PATH, token)
-            .then(_ => "Access token was saved to "+TOKEN_PATH)
-    }
-    else {
+            .then(_ => "Access token was saved to " + TOKEN_PATH)
+    } else {
         console.error("usage: login access_token")
         loginUrl()
     }
@@ -436,10 +534,11 @@ function login(args) {
 function ln(args) {
     if (args.length !== 1) {
         console.error("usage: ln file")
-    }
-    else {
+    } else {
         var remote = sanitize(args[0])
-        return call('/drive/root'+remote+':/action.createLink', 'POST', {"type":"view"})
+        return call('/drive/root' + remote + ':/action.createLink', 'POST', {
+                "type": "view"
+            })
             .then(result => {
                 console.log(Colors.underline(result.link.webUrl))
             })
@@ -449,7 +548,7 @@ function ln(args) {
 
 function chmod1(mode, remote) {
     remote = sanitize(remote)
-    return call('/drive/root'+remote+':/permissions')
+    return call('/drive/root' + remote + ':/permissions')
         .then(result => {
             // +w  x        POST (todo)
             // +w  read     PATCH (todo)
@@ -458,13 +557,14 @@ function chmod1(mode, remote) {
             // -w  read     NOP
             // -rw write    DELETE
             // -rw read     DELETE
-            return result.value.reduce( (prevp,cur) => prevp.then(_ => {
+            return result.value.reduce((prevp, cur) => prevp.then(_ => {
                 if (mode === '-rw') {
-                    return call('/drive/root'+remote+':/permissions/'+cur.id, 'DELETE')
-                }
-                else if (cur.roles[0] === 'write') {
+                    return call('/drive/root' + remote + ':/permissions/' + cur.id, 'DELETE')
+                } else if (cur.roles[0] === 'write') {
                     // FIXME: generic 'edit' links cannot be patched to be read only
-                    return call('/drive/root'+remote+':/permissions/'+cur.id, 'PATCH', {roles:["read"]})
+                    return call('/drive/root' + remote + ':/permissions/' + cur.id, 'PATCH', {
+                        roles: ["read"]
+                    })
                 }
             }), Promise.resolve())
         })
@@ -475,41 +575,40 @@ function chmod1(mode, remote) {
 function chmod(args) {
     if (args.length < 2) {
         console.error("usage: chmod mode file ...")
-    }
-    else {
+    } else {
         var mode = args[0]
         switch (mode) {
 
-        case '0600':
-        case '0700':
-        case '600':
-        case '700':
-        case 'g-rw':
-        case 'o-rw':
-        case 'go-rw':
-        case 'og-rw':
-        case '-rw':
-            mode = '-rw'
-            break
+            case '0600':
+            case '0700':
+            case '600':
+            case '700':
+            case 'g-rw':
+            case 'o-rw':
+            case 'go-rw':
+            case 'og-rw':
+            case '-rw':
+                mode = '-rw'
+                break
 
-        case '0644':
-        case '0744':
-        case '644':
-        case '744':
-        case 'g-w':
-        case 'o-w':
-        case 'go-w':
-        case 'og-w':
-        case '-w':
-            mode = '-w'
-            break
+            case '0644':
+            case '0744':
+            case '644':
+            case '744':
+            case 'g-w':
+            case 'o-w':
+            case 'go-w':
+            case 'og-w':
+            case '-w':
+                mode = '-w'
+                break
 
-        default:
-            console.error("chmod: Invalid file mode:", mode)
-            return
+            default:
+                console.error("chmod: Invalid file mode:", mode)
+                return
         }
 
-        return args.slice(1).reduce( (prevp,cur) => prevp.then(_ => chmod1(mode, cur)), Promise.resolve())
+        return args.slice(1).reduce((prevp, cur) => prevp.then(_ => chmod1(mode, cur)), Promise.resolve())
     }
 }
 
@@ -518,50 +617,53 @@ function main(argv) {
 
     switch (argv[2]) {
 
-    case undefined:
-    case 'help':
-        console.log(Colors.bold("\nOneDrive Command Line Interface (c) Enuma Technologies Limited"))
-        console.log("\nusage: onedrive COMMAND [arguments]\n\ncommands: cat chmod cp df help ln login ls mv rm wget")
-        return
+        case undefined:
+        case 'help':
+            console.log(Colors.bold("\nOneDrive Command Line Interface (c) Enuma Technologies Limited"))
+            console.log("\nusage: onedrive COMMAND [arguments]\n\ncommands: cat chmod cp df download-folder help ln login ls mv rm wget")
+            return
 
-    case 'cat':
-        return cat(argv.slice(3))
+        case 'cat':
+            return cat(argv.slice(3))
 
-    case 'wget':
-        return wget(argv.slice(3))
+        case 'wget':
+            return wget(argv.slice(3))
 
-    case 'ls':
-        return ls(argv.slice(3))
+        case 'ls':
+            return ls(argv.slice(3))
 
-    case 'df':
-        return df()
+        case 'df':
+            return df()
 
-    case 'cp':
-        return cp(argv.slice(3))
+        case 'cp':
+            return cp(argv.slice(3))
 
-    case 'mv':
-        return mv(argv.slice(3))
+        case 'mv':
+            return mv(argv.slice(3))
 
-    case 'rm':
-        return rm(argv.slice(3))
+        case 'rm':
+            return rm(argv.slice(3))
 
-    case 'ln':
-        return ln(argv.slice(3))
+        case 'ln':
+            return ln(argv.slice(3))
 
-    case 'login':
-        return login(argv.slice(3))
+        case 'login':
+            return login(argv.slice(3))
 
-    case 'chmod':
-        return chmod(argv.slice(3))
+        case 'chmod':
+            return chmod(argv.slice(3))
 
-    default:
-        throw new Error("Unknown command: "+argv[2])
+        case 'download-folder':
+            return downloadFolder(argv.slice(3));
+
+        default:
+            throw new Error("Unknown command: " + argv[2])
     }
 }
 
 
 Promise.resolve()
-    .then(_ => main(process.argv) )
+    .then(_ => main(process.argv))
     .then(result => {
         if (typeof result !== 'undefined') {
             console.log(Colors.green(result))
@@ -574,8 +676,7 @@ Promise.resolve()
             loginUrl()
             // Exit with -1 to ensure xargs stops invoking us
             process.exit(-1)
-        }
-        else {
+        } else {
             process.exit(1)
         }
     })
