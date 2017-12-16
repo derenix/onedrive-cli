@@ -11,6 +11,7 @@ const Crypto = require('crypto')
 const Zlib = require('zlib')
 const request = require('request')
 const mkdirp = require('mkdirp');
+const util = require('util');
 
 const TOKEN_PATH = Path.join(require('os').homedir(), '.onedrive-cli-token')
 
@@ -211,14 +212,13 @@ function downloadFolder(args) {
 
                 if (FS.existsSync(toFilePath)) {
 
-                    const fd = FS.openSync(toFilePath, 'r');
-                    const stats = FS.fstatSync(fd);
+                    const stats = util.inspect(toFilePath);
 
                     if (stats.size === 0) {
                         console.warn("WARNING: File at ", toFilePath, "has 0B size. Deleting & downloading again.");
                         FS.unlinkSync(toFilePath);
                     } else {
-                        //console.log("File already exists: " + toFilePath);
+                        console.log("File already exists: " + toFilePath);
                         toDownload--;
 
                         return;
